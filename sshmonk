@@ -1,0 +1,581 @@
+#!/usr/bin/env python
+
+from __future__ import print_function
+from __future__ import absolute_import
+
+help='''This program runs a sequence of commands on a remote host using SSH. Usually Fortigate,
+but it can be used for any remote SSH host with sane CLI prompt.
+
+./monitor.py [-s server_hostname] [-P port] [-u username] [-p password] [-k <keepalive in minutes>] [-o <dump also to stdout> ] [-a] [-i <inteval_seconds>]
+-s : hostname of the remote server to login to.
+-P : specify port. Default is kept up to ssh client, so to port 22.
+-u : username to user for login.
+-p : password to user for login.
+-a : append to logfile, don't truncate
+-i : set interval to execute commands again on remote host. IN SECONDS.
+-k : keepalive -- if set, once in specified interval send to remote host '#<timestamp>' string. Good to keep idle connection alive.
+-S : suffix filename with some string. Good if you are collecting with multiple sessions
+
+Script automatically opens file <server_hostname>.moncfg and execute all commands in specified interval.
+- each command on single line
+- if last character of the command is '#', command will be executed just at first iteration
+- if FIRST character of the command is '$', script will not wait for any output or prompt.
+- if there is ':' character in the command, rest of the string is used to parse interactive info. For example 'abc:1:q' line will run 'abc' command and send 'q' character after 1 second after command execution time
+
+Apart obvious usage patterns, script is great of collecting long-living sessions with sparse
+data received. If -k option is used, each interval specified timestamp mark is sent to remote peer.
+
+Example 1 
+---------
+- capture output of certain Fortigate commands each 1 minute
+- note on 'diag sys top 2 99:q:2' - run command 'diag sys top 2 99' and after 2 seconds send 'q' character(s)
+- log filename will be fortinet@192.168.1.1.log
+---------
+
+content of '192.168.1.1.moncfg':
+>>>
+execute time
+execute date
+get system status
+get hardware status
+diag sys top 2 99:q:2
+<<<
+
+$ ./monitor.py -s 192.168.1.1 -u fortinet -p fortinet -k 1 -i 60
+
+
+
+Example 2 
+---------
+- capture long-living authd debug: don't let session idle out!
+- add suffix to the file (log filename will be fortinet@192.168.1.1_authd.log)
+- always append to the log, don't overwrite if script terminates and is executed again
+---------
+
+content of '192.168.1.1.moncfg':
+>>>
+diagnose debug reset#
+diagnose debug console timestamp enable#
+diagnose debug application authd 0x2040#
+diagnose debug enable#
+$
+<<<
+./monitor.py -s 192.168.1.1 -u fortinet -p fortinet -k 1 -a -S authd
+
+'''
+
+import os
+import time
+import sys
+import re
+import socket
+import getopt
+import getpass
+import datetime
+import fileinput
+
+
+HAVE_NOTIFY=True
+
+try:
+    import pexpect
+except ImportError:
+    print ("You don't have pexpect installed")
+    sys.exit(-1)
+
+try:
+    import pynotify
+    pynotify.init("Monitoring")
+except ImportError:
+    HAVE_NOTIFY = False
+    print ("You don't have pynotify installed, but nevermind")
+
+
+def notify(title,msg):
+    if HAVE_NOTIFY:
+        try:
+            n = pynotify.Notification(title,msg)
+            n.show()
+        except Exception, e:
+            pass
+
+try:
+    raw_input
+except NameError:
+    raw_input = input
+
+
+#
+# Some constants.
+#
+COMMAND_PROMPT = '[a-zA-Z0-9_()-]+( \([a-zA-Z0-9_-]+\))* [#$] ' # Fortigate prompt with vdom support
+TERMINAL_PROMPT = '(?i)terminal type\?'
+TERMINAL_TYPE = 'vt100'
+# This is the prompt we get if SSH does not have the remote host's public key stored in the cache.
+SSH_NEWKEY = '(?i)are you sure you want to continue connecting'
+SSH_PORT = 22
+FILE_SUFFIX = None
+
+#COMMANDS = ['get system status','diag sys top:q']
+COMMANDS = []        # list of commands. Each command could be equipped with suffixes:
+                     #':' -- send additional characters after this command without waiting for PROMPT. You another ':'  enters delay in seconds before characters are sent. 
+                     #        eg. 'diag sys top:q:1' will send 'diag sys top', wait for one second and send 'q' character.
+                     #'#' -- don't repeat this command in keepalive mode =>  by default all commands in the .moncfg are sent 
+                     # ... diag sys top#:q:1 -- this will do the same, but is run just once at the very beginning 
+
+KEEPALIVE = False     # if true, let's loop and wait for further input INDEFINITELY. 
+COMMANDS_INTERVAL = 60   # send repetitive commands (not suffixed with '#' character)
+KEEPALIVE_INTERVAL = 60  # interval in seconds when we should send <enter> to keep session running. 
+DEBUK = False
+
+g_script_module = None
+g_script_module_err_cmd_output = False
+
+def log_debug(msg):
+    global DEBUK
+    if DEBUK:
+        print (msg)
+
+def read_commands(hostname):
+    
+    try:
+        fi = fileinput.input("%s.moncfg" % (hostname,))
+        for line in fi:
+            l = line.strip()
+
+            COMMANDS.append(l)
+            
+        return len(COMMANDS)
+    
+    except Exception, e:
+        print("Error loading config for host %s: %s" % (hostname,str(e)))
+        notify("Config error","Error loading config for host %s: %s" % (hostname,str(e)))
+    
+
+def exit_with_usage():
+    global help
+    
+    print(help)
+    os._exit(1)
+
+
+def run_keepalive(child, no_prompt=False):
+
+        if no_prompt:
+            print("...sending keepalive (don't wait for prompt)")
+        else:
+            print("...sending keepalive")
+        
+        t = time.time()
+        d = datetime.datetime.now()
+        
+        child.sendline('# keepalive @%d (%s)' % (t,d))
+        
+        if not no_prompt:
+            if child.expect (COMMAND_PROMPT) == 0:
+                log_debug("RECV: prompt")
+
+
+def clearbuf(buf,cmd):
+        ix = -1
+    
+        chb = buf.strip()
+        if(chb.startswith(cmd)):
+            chb = chb[len(cmd):].strip()
+            
+        r = ""
+        esc = 0
+        for C in chb:
+            ix += 1
+            
+            if esc > 0:
+                esc -= 1
+                continue
+            
+            if C == '\x1b':
+                esc = 2
+                continue
+            
+            
+            if C == '\r':
+                try:
+                    if[chb[ix + 1] == '\n']:
+                        continue
+                except IndexError:
+                    pass
+
+            
+            r += C
+                
+        
+        return r    
+
+def run_commands_once(child,cmds,monitor_mode=False):
+    
+    log_debug("RUN_ONCE: " + str(cmds))
+    
+    r = []
+    for c in cmds:
+        log_debug("RUN: " + c)
+        cc = c.split(':')
+
+        delay = 0
+        hashed = False
+        no_prompt = False
+        no_prompt_ka = time.time()
+        no_prompt_lines = 0
+
+        rr = ""
+        run_loop = True
+        
+        
+        # send immediately another part of the command, not waiting for the prompt
+        if len(cc) > 1:
+            # wait, if something is at 3rd place
+            if len(cc) > 2:
+                delay = float(cc[2])
+
+        cmd = str(cc[0])
+
+        # sanitize '#' suffix
+        if len(cmd.split('#')) > 1:
+            cmd = cmd.split('#')[0]
+            hashed = True
+            
+            if cmd and monitor_mode:
+                # this command should not go while in monitoring mode
+                log_debug("MONITOR: omitting command: " + cmd)
+                continue
+
+        # check prefixed commands -- don't wait for prompt! Just grab everything now on
+        if len(cmd.split('$')) > 1:
+            no_prompt = True
+            cmd = cmd.split('$')[1]   # don't forget, it's prefix, so index = 1!
+            log_debug("SEND (no prompt): " + cmd)
+        else:
+            if len(cmd) > 0:
+                log_debug("SEND: " + cmd)
+        
+        if len(cmd) > 0:
+            child.sendline (cmd)
+            log_debug('.')
+
+        if delay > 0:
+            log_debug("SEND delayed for %.2f" % (delay,))
+            #time.sleep(delay)
+            ii = child.expect([COMMAND_PROMPT,"--[Mm]ore-- ", pexpect.TIMEOUT],timeout=delay)
+            
+            rr += clearbuf(child.before,cmd)
+            
+            
+            
+            if len(cc[1]) > 0:
+                
+                # we send additonal command, let's try to wait for another prompt, but dont, complain if nothing happens
+                ii = child.expect([COMMAND_PROMPT, pexpect.TIMEOUT],timeout=delay)
+
+                log_debug("SEND (no newline): >" + cc[1] + "<")
+                child.send(cc[1])
+                log_debug("sending subcommand")
+                if ii == 0:
+                    rr += clearbuf(child.before,cmd)
+                    log_debug("  we got prompt")
+                    # we got prompt, don't wait for prompt further
+                    run_loop = False
+                else:
+                    log_debug("  timeout")
+                    #print("  rr = ")
+                    #print(repr(rr))
+
+        
+        while run_loop:  
+            if not no_prompt:
+                ii = child.expect([COMMAND_PROMPT,"--[Mm]ore-- "])
+                rr += clearbuf(child.before,cmd)
+                
+                # if prompt, break the loop!
+                if ii == 0:
+                    log_debug("RECV: prompt")
+                    r.append(rr)
+                    break
+                else: 
+                    log_debug("RECV: pager")
+                    # pager received, send space
+                    log_debug("SEND: <space>")
+                    child.sendline(' ')
+                    
+                _output_hook(c,rr)
+
+
+            else:
+                #ii = child.expect(["^.*\r?\n",COMMAND_PROMPT,pexpect.TIMEOUT],timeout=KEEPALIVE_INTERVAL)
+                ii = child.expect(["\r?\n$",COMMAND_PROMPT,pexpect.TIMEOUT],timeout=KEEPALIVE_INTERVAL)
+
+                if ii == 0:
+                    #log_debug("got bytes")
+                    no_prompt_lines += 1
+                    rr += clearbuf(child.before,cmd)
+                    # we don't append rr to r, it can be very long data
+                    
+                elif ii == 1:
+                    rr += clearbuf(child.before,cmd)
+                    # we don't append rr to r, it can be very long data
+                    
+                    log_debug("MONITOR: PROMPT! Returning control to the loop.")
+                    log_debug("DEBUG (before):" + child.before)
+                    break
+                else:
+                    log_debug("MONITOR: neither prompt or single line received")
+                
+                now = time.time()
+                if now > no_prompt_ka + KEEPALIVE_INTERVAL:
+                    # print some statistics
+                    if no_prompt_lines > 0:
+                        log_debug("%d lines captured" % (no_prompt_lines,))
+                        no_prompt_lines = 0
+                    
+                    run_keepalive(child, no_prompt=True)
+                    no_prompt_ka = now
+                    
+                _output_hook(c,rr)
+                
+                # in this mode, rr is truncated
+                rr = ""
+        
+        
+
+        
+    log_debug("RUN_ONCE: finished")        
+
+
+    return r
+
+def _output_hook(cmd, output):
+    global g_script_module, g_script_module_err_cmd_output
+
+    if g_script_module:
+        try:
+            g_script_module.cmd_output(cmd,output)
+        except AttributeError, e:
+            if not g_script_module_err_cmd_output:
+                print("module error: " + str(g_script_module) + " : " + str(e))
+                g_script_module_err_cmd_output = True
+
+    
+
+def main():
+
+    global COMMAND_PROMPT, TERMINAL_PROMPT, TERMINAL_TYPE, SSH_NEWKEY, KEEPALIVE, KEEPALIVE_INTERVAL, COMMANDS_INTERVAL, SSH_PORT, FILE_SUFFIX, DEBUK, g_script_module
+    ######################################################################
+    ## Parse the options, arguments, get ready, etc.
+    ######################################################################
+    try:
+        optlist, args = getopt.getopt(sys.argv[1:], 'h?s:u:p:k:i:P:aS:dm:', ['help','h','?'])
+    except Exception, e:
+        print(str(e))
+        exit_with_usage()
+    options = dict(optlist)
+    if len(args) > 1:
+        exit_with_usage()
+
+    if [elem for elem in options if elem in ['-h','--h','-?','--?','--help']]:
+        print("Help:")
+        exit_with_usage()
+        
+    if '-d' in options:
+        DEBUK = True
+
+    if '-s' in options:
+        host = options['-s']
+    else:
+        exit_with_usage()
+
+
+    if '-k' in options:
+        KEEPALIVE_INTERVAL = int(options['-k'])*60
+        KEEPALIVE = True
+        log_debug("DEBUG: keepalive = " + str(KEEPALIVE_INTERVAL))
+        
+    if '-i' in options:
+        COMMANDS_INTERVAL = int(options['-i'])
+        KEEPALIVE = True
+        log_debug("DEBUG: commands = " + str(COMMANDS_INTERVAL))
+        
+    if '-u' in options:
+        user = options['-u']
+    else:
+        exit_with_usage()
+
+    script_filename = "%s@%s.log" % (user,host)
+    if '-S'in options:
+        FILE_SUFFIX = options['-S']
+        script_filename = "%s@%s_%s.log" % (user,host,FILE_SUFFIX)
+        
+        
+
+    if '-a' in options:
+        fout = open(script_filename, "ab")
+    else:
+        fout = open(script_filename, "wb")
+
+        
+    if '-p' in options:
+        password = options['-p']
+    else:
+        password = getpass.getpass('password: ')
+
+    if '-P' in options:
+        SSH_PORT = options['-P']
+        
+    if '-m' in options:
+        mod_name = options['-m']
+        if mod_name.endswith(".py"):
+            mod_name = mod_name[0:-3]
+        try:
+            g_script_module = __import__(os.path.basename(mod_name),globals(),locals(),[],-1)
+            g_script_module.init()
+        except ImportError, e:
+            print("can't load module: " + mod_name)
+        except AttributeError, e:
+            print("module error: " + mod_name + " : " + str(e))
+
+
+    if read_commands(host) < 0:
+        sys.exit(-1)
+
+    while True:
+        try:
+            #
+            # Login via SSH
+            #
+            child = pexpect.spawn('ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -p %s -l %s %s'%(SSH_PORT, user, host), timeout=10)
+            i = child.expect([pexpect.TIMEOUT, SSH_NEWKEY, COMMAND_PROMPT, '(?i)password'])
+            if i == 0: # Timeout
+                print("Connection Timeout.")
+                notify("Monitor: %s@%s" % (user,host),"Connection Timeout.")
+                
+                log_debug('LOGIN before: %s' % (str(child.before),))
+                log_debug('LOGIN after: %s' % (str(child.after),))
+                log_debug('LOGIN %s' % (str(child),))
+                
+                if type(child.after) == type(pexpect.exceptions.ExceptionPexpect):
+                    time.sleep(5)
+                    print("Retrying")
+                    notify("Monitor: %s@%s" % (user,host),"Retrying.")
+                    child.close(True)
+                    continue
+                
+                sys.exit (1)
+            if i == 1: # In this case SSH does not have the public key cached.
+                print("public key not cached")
+                child.sendline ('yes')
+                child.expect ('(?i)password')
+                child.sendline(password)
+            
+            if i == 2:
+                # This may happen if a public key was setup to automatically login.
+                # But beware, the COMMAND_PROMPT at this point is very trivial and
+                # could be fooled by some output in the MOTD or login message.
+                pass
+            if i == 3:
+                child.sendline(password)
+                # Now we are either at the command prompt or
+                # the login process is asking for our terminal type.
+                i = child.expect ([COMMAND_PROMPT, TERMINAL_PROMPT])
+                if i == 1:
+                    child.sendline (TERMINAL_TYPE)
+                    child.expect (COMMAND_PROMPT)
+
+
+
+            notify("Monitor: %s@%s" % (user,host),"Monitoring just <b>started</b>, output captured in %s" % (script_filename,))
+            fout.write ('# %4d.%02d.%02d %02d:%02d:%02d \n' % time.localtime()[:-3])
+            child.logfile_read = fout
+            child.setecho(False)
+            
+            
+            # detect VDOMs
+            child.sendline ('get system status | grep \'Virtual domain configuration\'')
+            child.expect (COMMAND_PROMPT)
+            log_debug("VDOM DETECT: " + child.before)
+            if 'enable' in child.before.lower():
+                print('VDOMS enabled -- entering global!')
+                VDOMS_MODE = 1
+            else:
+                VDOMS_MODE = 0
+
+            
+            if VDOMS_MODE:
+                child.sendline('config global')
+                child.expect (COMMAND_PROMPT)
+                notify("Monitor: %s@%s" % (user,host),"Monitoring just <b>started</b>, output captured in %s" % (script_filename,))
+                #print(child.before)
+            
+            
+            run_commands_once(child, COMMANDS)
+
+            if KEEPALIVE:
+                t = time.time()
+                tt = time.time()
+            
+                notify("Monitor: %s@%s" % (user,host),"Now entering monitor mode!")
+
+                while True:
+                    now = time.time()
+                    
+                    ii = child.expect(['.+', pexpect.TIMEOUT], timeout=1)
+                    if ii == 0:
+                        log_debug("RECV: \'"+child.before+child.after+"\'")
+                        
+                    if now > t + KEEPALIVE_INTERVAL:
+                        t = time.time()
+                        run_keepalive(child)
+                        
+                        
+                    if now > tt + COMMANDS_INTERVAL: 
+                        log_debug("MONITOR: sending commands")
+                        tt = time.time()
+                        d = datetime.datetime.now()
+                        
+                        child.sendline('# commands @%d (%s)' % (tt,d))
+                        if child.expect (COMMAND_PROMPT) == 0:
+                            log_debug("RECV: prompt")
+
+                        run_commands_once(child,COMMANDS,monitor_mode=True)
+                    
+
+            if VDOMS_MODE:
+                child.sendline("end")
+            # Now exit the remote host.
+            child.sendline ('exit')
+            
+            # if we reach here, break the loop and exit
+            break
+
+
+        except socket.error, e:
+            print("EXCE: exception caught ",(e,))
+            child.close(True)
+            continue
+        except IOError, e:
+            print("EXCE: exception caught ",(e,))
+            child.close(True)
+            continue
+
+        except KeyboardInterrupt:
+            print("EXCE: Ctrl-C caught. Exiting.")
+            child.close(True)
+            break
+
+        except Exception, e:
+            print("EXCE: generic exception caught ",(e,))
+            time.sleep(5)
+            child.close(True)
+            continue
+
+
+    notify("Monitor: %s@%s" % (user,host),"Monitoring <b>finished</b>, output captured in %s" % (script_filename,))
+
+if __name__ == "__main__":
+    main()
+
